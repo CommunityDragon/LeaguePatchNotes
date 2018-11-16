@@ -1,0 +1,1445 @@
+#!/usr/bin/env python3
+import sys
+import re
+import json
+import logging
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger("patchnotesparser")
+
+
+def soup_match(elem, selector):
+    """Return True if the given soup element matches given selector-like string"""
+
+    # lazy parsing, sufficient for our needs
+    for m in re.finditer(r"([.#]?)([a-zA-Z0-9_-]+)", selector):
+        c, name = m.groups()
+        if not c:
+            if elem.name != name:
+                return False
+        elif c == "#":
+            if elem.get("id") != name:
+                return False
+        elif c == ".":
+            if name not in elem.get("class", []):
+                return False
+    return True
+
+def soup_has_string(elem):
+    return any(isinstance(elem, str) for elem in elem.children)
+
+def soup_extract_labels(elem):
+    """Extract labels from an element
+
+    Check for labels followed at the beginning given element.
+    Remove them from the element and return them as a list of strings.
+    """
+
+    labels = []
+    while elem.select_one("> span"):
+        e = elem.next
+        if e.string is None or e.get("class") != [e.string]:
+            break  # stop at first non-label element
+        labels.append(e.string)
+        e.extract()
+    return labels
+
+def soup_pretty_text(elem):
+    """Get element's text and prettify it"""
+    # replace <br/> by a special pattern for later replacement
+    for e in elem.find_all("br"):
+        e.replace_with("<{br}>")
+    text = re.sub(r"[\n\t ]+", " ", elem.get_text())
+    text = text.replace("<{br}>", "\n")
+    return text.strip()
+
+def extract_youtube_id(url):
+    m = re.search(r"//(?:www.youtube.com/(?:embed/|watch\?v=)|youtu.be/)([^?&]+)", url)
+    return m.group(1)
+
+
+
+class PatchHeader:
+    """
+    Generic representation of top-level section
+    """
+
+    def __init__(self, header, divs):
+        h2 = header.select_one("h2")
+        self.id = h2.get("id")
+        self.title = h2.text
+        logger.debug(f"parse header-primary {self.title!r}")
+
+        self.blocks = [PatchHeaderBlock(div) for div in divs]
+
+    def serialize(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "blocks": [o.serialize() for o in self.blocks],
+        }
+
+
+class PatchBlockBase:
+    """
+    Base block parser with common helpers
+    """
+
+    def __init__(self):
+        self.id = None
+        self.title = None
+        self.title_link = None
+        self.title_image = None  # may be a list
+        self.labels = None
+        self.summary = None
+        self.context = None
+
+    def serialize(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "titleLink": self.title_link,
+            "titleImage": self.title_image,
+            "labels": self.labels,
+            "summary": self.summary,
+            "context": self.context,
+        }
+
+    def _set_or_same(self, attr, value):
+        """Set attribute value, fail if it overrides a different one, ignore if None"""
+
+        if value is None:
+            return
+        old = getattr(self, attr, None)
+        if old is None:
+            setattr(self, attr, value)
+        else:
+            assert old == value, f"new mismatch for '{attr}'"
+
+    def parse_title(self, title):
+        assert len(title), "empty title"
+
+        self._set_or_same("id", title.get("id"))
+
+        images = []
+        # handle cases when there are multiple images
+        while title.next.name == "img":
+            elem = title.next
+            images.append(elem["src"])
+            elem.extract()
+        if len(images) == 1:
+            self._set_or_same("title_image", images[0])
+        elif len(images) > 1:
+            self._set_or_same("title_image", images)
+
+        self.labels = soup_extract_labels(title)
+        assert len(title) == 1, "multiple elements in block title"
+
+        elem = title.next
+        if elem.name == "a":
+            self._set_or_same("title_link", elem.get("href"))
+            self._set_or_same("title", elem.string.strip())
+        else:
+            assert isinstance(elem, str)
+            self._set_or_same("title", elem.strip())
+
+    def try_summary(self, elem):
+        if soup_match(elem, "p.summary"):
+            self.summary = soup_pretty_text(elem)
+            return True
+        return False
+
+    def try_context(self, elem):
+        if soup_match(elem, "blockquote.context"):
+            self.context = soup_pretty_text(elem)
+            return True
+        return False
+
+
+class PatchHeaderBlock(PatchBlockBase):
+    """
+    Generic representation of a white block from patch notes
+    """
+
+    def __init__(self, block=None):
+        super().__init__()
+        self.changes = []
+        self.contents = []  # unparsed "body" elements
+
+        if block:
+            self.parse(block)
+
+    def serialize(self):
+        d = super().serialize()
+        d["changes"] = [o.serialize() for o in self.changes]
+        return d
+
+    def parse(self, block):
+        assert len(block), "empty block"
+        children = block.children
+
+        try:
+            # look for "header" elements, in a given order
+            elem = next(children)
+
+            if soup_match(elem, ".reference-link"):
+                self.parse_reference_link(elem)
+                elem = next(children)
+
+            if soup_match(elem, "h3"):
+                # note: usually, class="change-title"
+                self.parse_title(elem)
+                elem = next(children)
+
+            if self.try_summary(elem):
+                elem = next(children)
+
+            if self.try_context(elem):
+                elem = next(children)
+
+            def skip_divider():
+                nonlocal elem
+                if soup_match(elem, "hr.divider"):
+                    elem = next(children)
+                    return True
+                return False
+
+            skip_divider()
+
+            # look for changes (right after known headers)
+            # title is optional
+            while soup_match(elem, "h4.change-detail-title") or soup_match(elem, "div.attribute-change"):
+                if elem.name == "h4":
+                    title, elem = elem, next(children)
+                else:
+                    title = None
+
+                # stop at next divider
+                change_elems = []
+                try:
+                    # some minor blocks don't add a divider between all elements
+                    while not (soup_match(elem, "hr.divider") or soup_match(elem, "h4.change-detail-title")):
+                        change_elems.append(elem)
+                        elem = next(children)
+                    skip_divider()
+                finally:
+                    assert change_elems, "change-detail-title without elements"
+                    self.changes.append(PatchChangeDetails(title, change_elems))
+
+            # don't forget to add the current element
+            self.contents = [elem]
+            self.contents.extend(children)
+
+
+        except StopIteration:
+            pass
+
+    def parse_reference_link(self, elem):
+        if elem.name == "a":
+            self._set_or_same("title_link", elem.get("href"))
+        else:
+            assert elem.name == "div", "unexpected .reference-link element: {elem.name}"
+
+        assert len(elem) == 1
+        img = elem.select_one("> img")
+        assert img, "expected <img> reflink"
+        self._set_or_same("title_image", img["src"])
+
+
+class PatchChangeDetails(PatchBlockBase):
+    """
+    Representation of a change block from patch notes
+    """
+
+    def __init__(self, title, elems):
+        super().__init__()
+        self.is_ability = None
+        self.changes = []
+
+        if title is not None:
+            self.parse_title(title)
+            self.is_ability = "ability-title" in title["class"]
+        self.parse_body(elems)
+
+    def serialize(self):
+        d = super().serialize()
+        d["is_ability"] = self.is_ability
+        d["changes"] = [o.serialize() for o in self.changes]
+        return d
+
+    def parse_body(self, elems):
+        children = iter(elems)
+
+        try:
+            # look for "header" elements, in a given order
+            elem = next(children)
+
+            if self.try_summary(elem):
+                elem = next(children)
+
+            if self.try_context(elem):
+                elem = next(children)
+
+            while soup_match(elem, "div.attribute-change"):
+                self.changes.append(PatchAttributeChange(elem))
+                elem = next(children)
+
+            assert False, f"unexpected element in change details: {elem.name}"
+
+        except StopIteration:
+            pass
+        assert self.changes, "empty change details"
+
+
+class PatchAttributeChange:
+    """
+    Single attribute change (usually "title: before => change")
+    """
+
+    def __init__(self, div):
+        self.title = None
+        self.labels = None
+        self.before = None  # removed or before change
+        self.after = None
+
+        self.parse(div)
+
+    def serialize(self):
+        d = {
+            "title": self.title,
+            "before": self.before,
+            "after": self.after,
+        }
+        if self.labels:
+            d["labels"] = self.labels
+        return d
+
+    def parse(self, div):
+        spans = []  # ("class", span)
+        for elem in div.children:
+            assert elem.name == "span"
+            assert len(elem.get("class", [])) == 1
+            spans.append((elem["class"][0], elem))
+
+        assert len(spans) >= 2, "unexpected span count in attribute change"
+
+        # first span: attribute name (title)
+        name, span = spans[0]
+        assert name == "attribute"
+        self.labels = soup_extract_labels(span)
+        if len(span) == 0:
+            # no title (may happen when there is a badge)
+            self.title = ""
+        else:
+            assert len(span) == 1 and span.string is not None
+            self.title = span.string
+
+        # multiple configurations are possible, gues it from second span
+        name, span = spans[1]
+        if name == "attribute-after":
+            # 'after' only
+            assert len(spans) == 2
+            self.after = soup_pretty_text(span)
+
+        elif name == "attribute-removed":
+            # 'before' only
+            assert len(spans) == 2
+            self.before = soup_pretty_text(span)
+
+        elif name == "attribute-before":
+            # 'before => after'
+            assert len(spans) == 4
+            self.before = soup_pretty_text(span)
+            assert spans[2][0] == "change-indicator"
+
+            name, span = spans[3]
+            assert name == "attribute-after"
+            self.after = soup_pretty_text(span)
+
+        else:
+            assert False, f"unexpected attribute's span name: {name}"
+
+
+class ElementChangeBase:
+    """
+    Base change for a whole element (champion, item, "other", ...).
+
+    Used for final serialization (not intermediate patch parsing).
+    Unset fields are not output.
+    """
+
+    def __init__(self):
+        self.summary = None
+        self.context = None
+        self.labels = []
+        self.mid_patch_update = False
+
+    def serialize(self):
+        d = {}
+        if self.summary:
+            d["summary"] = self.summary
+        if self.context:
+            d["context"] = self.context
+        if self.labels:
+            d["labels"] = self.labels
+        if self.mid_patch_update:
+            d["midPatchUpdate"] = self.mid_patch_update
+        return d
+
+class BasicChangeGroup:
+    """Change group without superfluous properties"""
+
+    def __init__(self, change: PatchChangeDetails = None):
+        self.title = None
+        self.changes = None
+
+        if change:
+            self.parse_change_details(change)
+
+    def serialize(self):
+        return {
+            "title": self.title,
+            "changes": [o.serialize() for o in self.changes],
+        }
+
+    def parse_change_details(self, change):
+        self.title = change.title
+        self.changes = change.changes
+
+        assert not change.is_ability
+        assert not change.title_link
+        assert not change.title_image
+        assert not change.labels
+        assert not change.summary
+        assert not change.context
+
+
+class ChampionChange(ElementChangeBase):
+    def __init__(self, block: PatchHeaderBlock = None):
+        super().__init__()
+        self.name = None
+        self.abilities = []
+        self.others = []  # uncategorized changes
+
+        if block:
+            self.parse_block(block)
+
+    def serialize(self):
+        d = super().serialize()
+        d["name"] = self.name
+        d["abilities"] = [o.serialize() for o in self.abilities]
+        d["others"] = [o.serialize() for o in self.others]
+        return d
+
+    def parse_block(self, block: PatchHeaderBlock):
+        self.name = self.name_from_image_url(block.title_image)
+
+        self.summary = block.summary
+        self.context = block.context
+        assert not block.labels, "unexpected labels on champion (not handled yet)"
+
+        for change in block.changes:
+            if change.is_ability:
+                self.abilities.append(ChampionAbilityChange(change))
+            else:
+                self.others.append(BasicChangeGroup(change))
+
+        assert not block.contents, f"unparsed elements in champion block of '{self.name}'"
+
+    @staticmethod
+    def name_from_image_url(url):
+        assert url is not None
+        m = re.search(r"//ddragon.leagueoflegends.com/cdn/[^/]+/img/champion/([^.?]+)\.png", url)
+        return m.group(1)
+
+    @classmethod
+    def split_block(cls, block: PatchHeaderBlock, mid_patch_update=False):
+        """Handle a single block with changes for multiple champions
+
+        Copy the summary and context to each individual champions.
+        Handle groups with multiple images.
+        """
+        assert not block.title_image
+        assert not block.title_link
+        assert not block.contents
+
+        for group in block.changes:
+            images = group.title_image
+            if isinstance(images, str):
+                images = [images]
+            for image in images:
+                change = cls()
+                change.name = cls.name_from_image_url(image)
+                if block.summary:
+                    assert not group.summary, "cannot split: multiple summaries provided"
+                    change.summary = block.summary
+                else:
+                    change.summary = group.summary
+                if block.context:
+                    assert not group.context, "cannot split: multiple summaries provided"
+                    change.context = block.context
+                else:
+                    change.context = group.context
+                #XXX identify ability changes based on title
+                change.others = group.changes
+                change.mid_patch_update = mid_patch_update
+                yield change
+
+class ChampionNewOrReworked:
+    """New or reworked champion"""
+
+    def __init__(self, block: PatchHeaderBlock = None):
+        self.name = None
+        self.reveal_link = None
+        self.spotlight_youtube_id = None
+        self.trailer_youtube_id = None
+
+        if block:
+            self.parse_block(block)
+
+    def serialize(self):
+        return {
+            "name": self.name,
+            "newOrReworked": True,
+            "revealLink": self.reveal_link,
+            "spotlightYoutubeId": self.spotlight_youtube_id,
+            "trailerYoutubeId": self.trailer_youtube_id,
+        }
+
+    def parse_block(self, block: PatchHeaderBlock):
+        self.name = ChampionChange.name_from_image_url(block.title_image)
+
+        # assume:
+        # - a context with a small announcement (skipped)
+        # - a list of links
+        # - an "available on League Display" block (skipped)
+        assert not block.labels
+        assert not block.changes
+        assert not block.summary
+        assert block.contents and block.contents[0].name == "ul"
+
+        for elem in block.contents[0]:
+            assert elem.name == "li"
+            assert len(elem) == 1
+            link = elem.select_one("> a")["href"]
+            text = elem.string
+            if text == "Champion Reveal":
+                self.reveal_link = link
+            elif text == "Champion Spotlight":
+                self.spotlight_youtube_id = extract_youtube_id(link)
+            elif text == "Champion Trailer" or text == "Champion Teaser":
+                self.trailer_youtube_id = extract_youtube_id(link)
+            else:
+                assert False, f"unexpected new/reworked champion link: {text!r}"
+
+class ChampionAbilityChange:
+    def __init__(self, change: PatchChangeDetails = None):
+        self.key = None  # Q, W, E, R, P (passive)
+        self.name = None  # pretty name
+        self.summary = None
+        self.context = None
+        self.labels = None
+        self.changes = []
+
+        if change:
+            self.parse_change(change)
+
+    def serialize(self):
+        d = {
+            "key": self.key,
+            "name": self.name,
+            "changes": [o.serialize() for o in self.changes],
+        }
+        if self.summary:
+            d["summary"] = self.summary
+        if self.context:
+            d["context"] = self.context
+        return d
+
+    def parse_change(self, change: PatchChangeDetails):
+        assert change.is_ability
+        self.key, self.name = self.parse_ability_name(change.title)
+
+        self.summary = change.summary
+        self.context = change.context
+        self.labels = change.labels
+
+        self.changes = change.changes
+
+    @staticmethod
+    def parse_ability_name(title):
+        m = re.match(r"^(Q|W|E|R|Passive) - (.*)$", title)
+        if not m:
+            return None
+        key, name = m.groups()
+        if key == "Passive":
+            key = "P"
+        return key, name
+
+
+class ItemChange(ElementChangeBase):
+    def __init__(self, block: PatchHeaderBlock = None):
+        super().__init__()
+        self.id = None
+        self.changes = []
+
+        if block:
+            self.parse_block(block)
+
+    def serialize(self):
+        d = super().serialize()
+        d["id"] = self.id
+        d["changes"] = [o.serialize() for o in self.changes]
+        return d
+
+    def parse_block(self, block: PatchHeaderBlock):
+        self.id = self.id_from_image_url(block.title_image)
+
+        self.summary = block.summary
+        self.context = block.context
+        self.labels = block.labels
+
+        for change in block.changes:
+            self.changes.append(BasicChangeGroup(change))
+
+        assert not block.contents, f"unparsed elements in item block of {block.title!r}"
+
+    @classmethod
+    def split_block(cls, block: PatchHeaderBlock, mid_patch_update=False):
+        """Handle a single block with changes for multiple items
+
+        Copy the summary and context to each individual items.
+        Handle groups with multiple images.
+        """
+        assert not block.title_image
+        assert not block.title_link
+        assert not block.contents
+
+        for group in block.changes:
+            images = group.title_image
+            if isinstance(images, str):
+                images = [images]
+            for image in images:
+                change = cls()
+                change.id = cls.id_from_image_url(image)
+                if block.summary:
+                    assert not group.summary, "cannot split: multiple summaries provided"
+                    change.summary = block.summary
+                else:
+                    change.summary = group.summary
+                if block.context:
+                    assert not group.context, "cannot split: multiple summaries provided"
+                    change.context = block.context
+                else:
+                    change.context = group.context
+                change.changes = group.changes
+                change.mid_patch_update = mid_patch_update
+                yield change
+
+    @staticmethod
+    def id_from_image_url(url):
+        assert url is not None
+        m = re.search(r"//ddragon.leagueoflegends.com/cdn/[^/]+/img/item/(\d+)\.png", url)
+        return int(m.group(1))
+
+
+class SummonerSpellChange(ElementChangeBase):
+    def __init__(self, block: PatchHeaderBlock = None):
+        super().__init__()
+        self.name = None
+        self.changes = []
+
+        if block:
+            self.parse_block(block)
+
+    def serialize(self):
+        d = super().serialize()
+        d["name"] = self.name
+        d["changes"] = [o.serialize() for o in self.changes]
+        return d
+
+    def parse_block(self, block: PatchHeaderBlock):
+        self.name = self.name_from_image_url(block.title_image)
+
+        self.summary = block.summary
+        self.context = block.context
+        self.labels = block.labels
+
+        # assume changes are not in groups
+        assert len(block.changes) <= 1
+        if block.changes:
+            change = block.changes[0]
+            assert not change.title_link
+            assert not change.title_image
+            assert not change.labels
+            assert not change.summary
+            assert not change.context
+            self.changes = change.changes
+
+        assert not block.contents, f"unparsed elements in summoner spell block of '{self.name}'"
+
+    @staticmethod
+    def name_from_image_url(url):
+        assert url is not None
+        m = re.search(r"//ddragon.leagueoflegends.com/cdn/[^/]+/img/spell/(?:Summoner)?([^/.?&]+)\.png", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"/public/images/articles/[^/]+/[^/]+/[^/]+/(Heal)\.(?:jpg|png)", url)
+        return m.group(1)
+
+
+class RuneChange(ElementChangeBase):
+    def __init__(self, block: PatchHeaderBlock = None):
+        super().__init__()
+        self.name = None
+        self.changes = []
+
+        if block:
+            self.parse_block(block)
+
+    def serialize(self):
+        d = super().serialize()
+        d["name"] = self.name
+        d["changes"] = [o.serialize() for o in self.changes]
+        return d
+
+    def parse_block(self, block: PatchHeaderBlock):
+        self.name = self.name_from_image_url(block.title_image)
+
+        self.summary = block.summary
+        self.context = block.context
+        self.labels = block.labels
+
+        # assume changes are not in groups
+        assert len(block.changes) <= 1
+        if block.changes:
+            change = block.changes[0]
+            assert not change.title_link
+            assert not change.title_image
+            assert not change.labels
+            assert not change.summary
+            assert not change.context
+            self.changes = change.changes
+
+        assert not block.contents, f"unparsed elements in rune block of '{self.name}'"
+
+    @staticmethod
+    def name_from_image_url(url):
+        assert url is not None
+        m = re.search(r"//ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/[^/]+/([^/]+)/[^.?]+\.png", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"/public/images/articles/[^/]+/[^/]+/[^/]+/([^.?&_]+)(?:_Rune)?\.(?:jpg|png)", url)
+        return m.group(1)
+
+
+class OtherChange(ElementChangeBase):
+    def __init__(self, elem=None, nested=False):
+        super().__init__()
+        self.title = None
+        self.changes = []
+        self.nested = nested
+
+        if isinstance(elem, PatchHeader):
+            self.parse_header(elem, nested)
+        elif isinstance(elem, PatchHeaderBlock):
+            self.parse_header_block(elem)
+        elif elem is not None:
+            raise TypeError(elem)
+
+    def serialize(self):
+        d = super().serialize()
+        d["title"] = self.title
+        d["changes"] = [o.serialize() for o in self.changes]
+        if self.nested:
+            d["nested"] = self.nested
+        return d
+
+    def parse_header(self, header: PatchHeader, nested=False):
+        assert header.title
+        self.title = header.title
+
+        assert len(header.blocks) == 1
+        block = header.blocks[0]
+        # Usually, "other" changes are a single block. Add a special case
+        # for nested ones and require to be explicit about it.
+        if nested:
+            self.parse_header_block_nested(block)
+        else:
+            self.parse_header_block(block)
+
+    def parse_header_block(self, block: PatchHeaderBlock):
+        if block.title:
+            assert self.title is None
+            self.title = block.title
+
+        assert not block.title_link
+        assert not block.title_image
+        assert not block.labels
+
+        self.summary = block.summary
+        self.context = block.context
+
+        # assume changes are not in groups
+        # (use "nested" flag otherwise)
+        assert len(block.changes) <= 1
+        if block.changes:
+            change = block.changes[0]
+            assert not change.title_link
+            assert not change.title_image
+            assert not change.labels
+            assert not change.summary
+            assert not change.context
+            self.changes = change.changes
+
+        assert not block.contents, f"unparsed elements in 'other' block of '{self.title}'"
+
+    def parse_header_block_nested(self, block: PatchHeaderBlock):
+        self.nested = True
+        if block.title:
+            assert self.title is None
+            self.title = block.title
+
+        assert not block.title_link
+        assert not block.title_image
+        assert not block.labels
+
+        self.summary = block.summary
+        self.context = block.context
+
+        for block_change in block.changes:
+            assert not block_change.title_link
+            assert not block_change.title_image
+            assert not block_change.labels
+            change = OtherChange()
+            change.title = block_change.title
+            change.summary = block_change.summary
+            change.context = block_change.context
+            change.changes = block_change.changes
+            self.changes.append(change)
+
+        assert not block.contents, f"unparsed elements in 'other' block of '{self.title}'"
+
+patch_notes_parsers = {}  # {version: parser_class}
+
+class PatchNotesParserMeta(type):
+    """Meta class to register version-specific parsers"""
+    def __new__(mcs, name, bases, fields):
+        cls = type.__new__(mcs, name, bases, fields)
+        patch_version = fields.get("parser_patch_version")
+        if patch_version is not None:
+            assert patch_version not in patch_notes_parsers, f"multiple PatchNotesParser for version {patch_version}"
+            patch_notes_parsers[patch_version] = cls
+        return cls
+
+
+class PatchNotesParser(object, metaclass=PatchNotesParserMeta):
+    """
+    Parse League of Legends patch notes into a generic structure
+
+    Parsing is lenient but will inform about any suspicious unparsed elements.
+    """
+
+    # Define in subclasses for patch version specific handling
+    parser_patch_version = None
+    # List of new and reworked champions (ddragon's name)
+    # Note: only the links will be preserved by the default handling.
+    parser_new_or_reworked_champions = []
+    # List of header IDs to put in "others" (see dispatch_header())
+    parser_others_headers = []
+    # List of header IDs to ignore (see skipped in dispatch_header())
+    parser_removed_headers = []
+    # List of block IDs to remove (see remove_block_by_title_id())
+    parser_removed_blocks = []
+
+    def __init__(self, soup):
+        self.version = self.get_version_from_soup(soup)
+        self.summary = None
+        self.highlights_youtube_id = None
+        self.champions = []
+        self.items = []
+        self.summoner_spells = []
+        self.runes = []
+        self.bugfixes = []
+        self.others = []  # uncategorized headers
+
+        self.normalize_soup(soup)
+        container = soup.select_one("#patch-notes-container")
+        self.parse_container(container)
+
+    def serialize(self):
+        return {
+            "version": self.version,
+            "summary": self.summary,
+            "highlightsYoutubeId": self.highlights_youtube_id,
+            "champions": [o.serialize() for o in self.champions],
+            "items": [o.serialize() for o in self.items],
+            "summonerSpells": [o.serialize() for o in self.summoner_spells],
+            "runes": [o.serialize() for o in self.runes],
+            "bugfixes": self.bugfixes,
+            "others": [o.serialize() for o in self.others],
+        }
+
+    @staticmethod
+    def get_soup(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            return BeautifulSoup(f, "html.parser")
+
+    @staticmethod
+    def get_version_from_soup(soup):
+        title = soup.select_one("title").text.strip()
+        m = re.match(r"^Patch (\d+\.\d+) Notes", title, re.I)
+        return m.group(1)
+
+    @classmethod
+    def normalize_soup(cls, soup):
+        """Modify the soup to fix parsing problems"""
+
+        # remove all empty strings (after stripping)
+        for e in soup.find_all(string=True):
+            if not e.strip():
+                e.extract()
+
+        container = soup.select_one("#patch-notes-container")
+
+        # fix highlight's <iframe> not in subdivs (happen in some patches)
+        elem = container.select_one("header.header-primary + div.content-border > div.white-stone > iframe")
+        if elem:
+            logger.debug("wrap highlight's <iframe>")
+            elem.wrap(soup.new_tag("div"))
+
+        # remove unwanted blocks
+        # note: headers are not removed here because their blocks need to be grouped first
+        for title_id in cls.parser_removed_blocks:
+            assert cls.remove_block_by_title_id(container, title_id), f"failed to remove block {title_id!r}"
+
+
+    @staticmethod
+    def remove_block_by_title_id(soup, title_id):
+        """Remove a section block, based on it's ID"""
+
+        # don't use select_one(), some IDs contain ','
+        elem = soup.find("h3", id=title_id)
+        if not elem:
+            return False
+        elem = elem.parent.parent.parent
+        assert soup_match(elem, "div.content-border")
+        elem.extract()
+        return True
+
+    @classmethod
+    def from_file(cls, filename):
+        """Parse patch notes from a filename, return a PatchNotesParser"""
+
+        soup = cls.get_soup(filename)
+        return cls.from_soup(soup)
+
+    @classmethod
+    def from_soup(cls, soup):
+        """Parse patch notes from a soup, return a PatchNotesParser
+
+        Note: parsing is destructive. The soup will be modified.
+        """
+
+        version = cls.get_version_from_soup(soup)
+        parser = patch_notes_parsers.get(version)
+        if parser is None:
+            parser = cls
+            logger.info(f"parsing patch notes for version {version} with default parser")
+        else:
+            logger.info(f"parsing patch notes for version {version} with specific parser")
+        return parser(soup)
+
+
+    def parse_container(self, container):
+        """Parse the top-level container"""
+
+        assert not soup_has_string(container), "unexpected string in top-level container"
+        self.summary = soup_pretty_text(container.select_one("> blockquote.context"))
+
+        # filter useless top-level container elements
+        # note: some patches have multiple <h2 id="patch-top"></h2>
+        children = []
+        for elem in container.children:
+            if elem.name == "br":
+                continue
+            if elem.name == "p" and not elem.contents:
+                continue  # empty <p>
+            if soup_match(elem, "h2#patch-top"):
+                assert not elem.contents, "h2#patch-top not empty"
+                continue
+            if elem.name == "p" and elem.select("> a.btt"):
+                # back-to-top link
+                continue
+
+            children.append(elem)
+
+        assert soup_match(children[0], "blockquote.context")
+        assert soup_match(children[1], "div.context-designers")
+
+        # iterate on <header class="header-primary">
+        # collect all the following <div class="content-border>
+        headers = []  # [(header, divs)]
+        for elem in children[2:]:
+            if soup_match(elem, "header.header-primary"):
+                assert not headers or headers[-1][1], "two successive header-primary without div.content-border"
+                headers.append((elem, []))
+            elif soup_match(elem, "div.content-border"):
+                assert headers, "div.content-border found without a previous header-primary"
+                # expect <div class="patch-change-block white-stone accent-before"><div> child, alone
+                assert len(elem) == 1 and len(elem.next) == 1
+                # note: some divs also have a 'patch-change-block' class
+                div = elem.select_one("> div.white-stone.accent-before > div")
+                assert div
+                headers[-1][1].append(div)
+            else:
+                assert False, "unexpected element in top-level container"
+
+        for title, divs in headers:
+            header = PatchHeader(title, divs)
+            self.dispatch_header(header)
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "patch-upcoming-skins-and-chromas":
+            return  # always ignore skin and chromas
+        elif header.id in self.parser_removed_headers:
+            return  # skipped header (note: we don't check that they actually exist)
+        elif header.id in self.parser_others_headers:
+            # "others" header (note: we don't check that they actually exist)
+            self.others.append(OtherChange(header))
+        elif header.id == "patch-patch-highlights":
+            self.handle_patch_highlights_header(header)
+        elif header.id == "patch-champions":
+            self.handle_champions_header(header)
+        elif header.id == "patch-items":
+            self.handle_items_header(header)
+        elif header.id == "patch-summoner-spells":
+            self.handle_summoner_spells_header(header)
+        elif header.id == "patch-runes":
+            self.handle_runes_header(header)
+        elif header.id == "patch-bugfixes":
+            self.handle_bugfixes_header(header)
+        else:
+            logger.warning(f"patch {self.version}: unhandled header: {header.title!r} ({header.id})")
+
+    def handle_patch_highlights_header(self, header: PatchHeader):
+        logger.debug(f"handle patch highlights header")
+        assert len(header.blocks) == 1
+        block = header.blocks[0]
+        assert not block.changes
+        assert len(block.contents) == 1
+        iframe = block.contents[0]
+        assert iframe.name == "iframe"
+        self.highlights_youtube_id = extract_youtube_id(iframe["src"])
+
+    def handle_champions_header(self, header: PatchHeader):
+        logger.debug(f"handle champions header")
+        for block in header.blocks:
+            assert block.title_image
+            name = ChampionChange.name_from_image_url(block.title_image)
+            if name in self.parser_new_or_reworked_champions:
+                self.champions.append(ChampionNewOrReworked(block))
+            else:
+                self.champions.append(ChampionChange(block))
+
+    def handle_items_header(self, header: PatchHeader):
+        logger.debug(f"handle items header")
+        for block in header.blocks:
+            self.items.append(ItemChange(block))
+
+    def handle_summoner_spells_header(self, header: PatchHeader):
+        logger.debug(f"handle summoner spells header")
+        for block in header.blocks:
+            self.summoner_spells.append(SummonerSpellChange(block))
+
+    def handle_runes_header(self, header: PatchHeader):
+        logger.debug(f"handle runes header")
+        for block in header.blocks:
+            self.runes.append(RuneChange(block))
+
+    def handle_bugfixes_header(self, header: PatchHeader):
+        logger.debug(f"handle bugfixes header")
+        assert len(header.blocks) == 1
+        block = header.blocks[0]
+        assert not block.changes
+        assert len(block.contents) == 1
+        ul = block.contents[0]
+        assert ul.name == "ul"
+        for elem in ul.children:
+            assert elem.name == "li"
+            self.bugfixes.append(soup_pretty_text(elem))
+
+
+# Version-specific fixes
+
+class PatchNotesParser_8_13(PatchNotesParser):
+    parser_patch_version = "8.13"
+    parser_new_or_reworked_champions = ["Aatrox"]
+    parser_others_headers = [
+        "patch-instant-feedback",
+    ]
+
+    @classmethod
+    def normalize_soup(cls, soup):
+        super().normalize_soup(soup)
+        container = soup.select_one("#patch-notes-container")
+
+        # "Outer Turret Gold" change not put into a proper "context" block
+        for elem in container.select("h4.change-detail-title"):
+            if elem.string == "Outer Turret Gold":
+                elem = elem.select_one("+ p.summary + p")
+                break
+        else:
+            assert False, "'Outer Turret Gold' title not found"
+        # transform into a blockquote.context
+        elem.name = "blockquote"
+        elem["class"] = ["blockquote", "context"]
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "patch-update":
+            balance_update, aatrox_balance_update = header.blocks
+
+            # The block includes both champions and items. Rebuild a header for
+            # each set of changes. Drop the context as it is too general and
+            # does not actually provide context
+            assert not balance_update.contents
+            champions_header = PatchHeaderBlock()
+            items_header = PatchHeaderBlock()
+            for group in balance_update.changes:
+                if "/champion/" in group.title_image:
+                    champions_header.changes.append(group)
+                elif "/item/" in group.title_image:
+                    items_header.changes.append(group)
+                else:
+                    assert False, "cannot categorize change"
+            self.champions.extend(ChampionChange.split_block(champions_header, mid_patch_update=True))
+            self.items.extend(ItemChange.split_block(items_header, mid_patch_update=True))
+
+            change = ChampionChange(aatrox_balance_update)
+            change.mid_patch_update = True
+            self.champions.append(change)
+
+        elif header.id == "patch-simple-buffs" or header.id == "patch-simple-nerfs":
+            self.handle_champions_header(header)
+        elif header.id == "patch-runes":
+            # runes with a first "Domination Style Bonus" block
+            for block in header.blocks[1:]:
+                self.runes.append(RuneChange(block))
+            # add an individual "others" change with the first block
+            self.others.append(OtherChange(header.blocks[0]))
+        elif header.id == "patch-jungle":
+            assert len(header.blocks) == 1
+            # the actual title is in the block, don't use 'parser_others_headers'
+            self.others.append(OtherChange(header.blocks[0]))
+        elif header.id == "patch-early-game-snowball":
+            self.others.append(OtherChange(header, nested=True))
+        else:
+            super().dispatch_header(header)
+
+
+class PatchNotesParser_8_14(PatchNotesParser):
+    parser_patch_version = "8.14"
+    parser_others_headers = [
+        "patch-cursor-update",  # note: image removed in normalize_soup()
+        "patch-stats",  # actually "Wards Collection" (copy/paste bug)
+        "patch-champ-select",
+    ]
+    parser_removed_blocks = [
+        # "Mid-Patch 8.13 Updates" reminder (changes are not part of 8.14)
+        "patch-mid-patch-8.13-updates",
+        # there are two of them with the same ID (one champions, one for items)
+        "patch-mid-patch-8.13-updates",
+        "patch-sfx-updates",
+    ]
+
+    @classmethod
+    def normalize_soup(cls, soup):
+        super().normalize_soup(soup)
+        container = soup.select_one("#patch-notes-container")
+
+        # Fizz' "refund on kill" attribute change contains an additional
+        # span without class with a new effect.
+        for elem in container.select("h3#patch-fizz ~ div.attribute-change"):
+            if elem.contents[0].string == "REFUND ON KILL":
+                break
+        else:
+            assert False, "'refund onk kill' attribute not found"
+
+        # Duplicate the attribute to add one with the new effect
+        new_elem = soup.new_tag("div", **{"class": "attribute-change"})
+        e = soup.new_tag("span", **{"class": "attribute"})
+        e.string = "REFUND ON KILL"
+        new_elem.append(e)
+        e = soup.new_tag("span", **{"class": "attribute-after"})
+        e.string = elem.contents[1].extract().string
+        new_elem.append(e)
+        elem.insert_before(new_elem)
+
+        # Remove the image and title from "Cursor Update"
+        elem = container.select_one("h2#patch-cursor-update")
+        elem = elem.parent.select_one("+ div.content-border > div.white-stone > div")
+        div, p = elem.contents[0:2]
+        assert soup_match(div, "div.content-border") and div.select_one("> img")
+        assert soup_match(p, "p.summary")
+        div.extract()
+        p.extract()
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "patch-simple-buffs" or header.id == "patch-simple-nerfs":
+            self.handle_champions_header(header)
+        elif header.id == "patch-items":
+            assert len(header.blocks) == 1
+            self.items.extend(ItemChange.split_block(header.blocks[0]))
+        else:
+            super().dispatch_header(header)
+
+    def handle_champions_header(self, header: PatchHeader):
+        # remove "Mid-Patch 8.13 Updates" last change group for Aatrox
+        if header.id == "patch-champions":
+            for block in header.blocks:
+                if block.id == "patch-aatrox":
+                    assert block.changes[-1].title == "Mid-Patch 8.13 Updates"
+                    del block.changes[-1]
+        super().handle_champions_header(header)
+
+
+class PatchNotesParser_8_15(PatchNotesParser):
+    parser_patch_version = "8.15"
+    parser_new_or_reworked_champions = ["Akali"]
+    parser_others_headers = [
+        "patch-chromas-collection",
+        "patch-store,-gifting,-and-forging",
+        "patch-stats",
+    ]
+
+    @classmethod
+    def normalize_soup(cls, soup):
+        super().normalize_soup(soup)
+
+        # "Perfect Timing" title is 'h4' instead of 'h4'
+        elem = soup.select_one("h2#patch-runes")
+        elem = elem.parent.select_one("+ div.content-border > div.white-stone > div > h4")
+        elem.name = "h3"
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "patch-items":
+            # a lot of special groups to adapt in this patch
+            (
+                support_items,
+                marksman_itemization,
+                infinity_edge,
+                stormrazer,
+                essence_reaver,
+                zeal_items,
+                mercurial_scimitar,
+                jungle_items,
+            ) = header.blocks
+
+            # standard items
+            for block in (infinity_edge, stormrazer, essence_reaver, mercurial_scimitar):
+                self.items.append(ItemChange(block))
+
+            # "Support Items", "Zeal Items": split
+            for block in (support_items, zeal_items):
+                self.items.extend(ItemChange.split_block(block))
+
+            # "Marksman Itemization", "Jungle Items": add as "others" change
+            for block in (marksman_itemization, jungle_items):
+                self.others.append(OtherChange(block))
+
+        else:
+            super().dispatch_header(header)
+
+class PatchNotesParser_8_16(PatchNotesParser):
+    parser_patch_version = "8.16"
+    parser_others_headers = [
+        "patch-nexus-blitz-alpha",
+        "patch-summoner-level",
+        "patch-end-of-game-lobby",
+        "patch-your-shop-returns!",
+    ]
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "patch-tanks":
+            # copy the context from first block to each following block
+            context = header.blocks[0].context
+            for block in header.blocks[1:]:
+                assert not block.context
+                block.context = context
+                self.champions.append(ChampionChange(block))
+        elif header.id == "patch-runes":
+            # copy the context from first block to each following block
+            context = header.blocks[0].context
+            for block in header.blocks[1:]:
+                assert not block.context
+                block.context = context
+                self.runes.append(RuneChange(block))
+        else:
+            super().dispatch_header(header)
+
+class PatchNotesParser_8_17(PatchNotesParser):
+    parser_patch_version = "8.17"
+    parser_new_or_reworked_champions = ["Nunu"]
+    parser_others_headers = [
+        "patch-nexus-blitz",
+        "patch-summoner-spells",  # non-gameplay change
+    ]
+
+class PatchNotesParser_8_18(PatchNotesParser):
+    parser_patch_version = "8.18"
+    parser_new_or_reworked_champions = ["Nunu"]
+    parser_removed_headers = [
+        "patch-nexus-blitz-alpha",
+        "patch-smite-auto-select",
+        "patch-minimap-icons",
+        "patch-new-game-mode",
+    ]
+
+class PatchNotesParser_8_19(PatchNotesParser):
+    parser_patch_version = "8.19"
+    parser_others_headers = [
+        "patch-movement-speed-slow-vfx",
+        "patch-objective-steal-announcements",
+        "patch-profile-page",
+        "patch-normal-draft-matchmaking",
+    ]
+    parser_removed_headers = [
+        "patch-champion-vfx-and-sfx-updates",
+        "patch-upcoming-skins,-chromas-and-icons",
+    ]
+
+    @classmethod
+    def normalize_soup(cls, soup):
+        super().normalize_soup(soup)
+        container = soup.select_one("#patch-notes-container")
+
+        # badly formatted "Torment" change details
+        elem = container.select_one("> div.content-border > div.patch-change-block > div > p > strong")
+        assert elem.string == "Torment:"
+        # replace parent <p> with a title and a divider
+        elem = elem.parent
+        new_elem = soup.new_tag("h4", **{"class": "change-detail-title"})
+        new_elem.string = "Torment"
+        elem.replace_with(new_elem)
+        new_elem.insert_before(soup.new_tag("hr", **{"class": "divider"}))
+
+        # missing <ul> around <li> in "Bugfixes"
+        elem = container.select_one("> header > h2#patch-bugfixes")
+        elem = elem.parent.select_one("+ div.content-border > div.white-stone > div > li")
+        elem.wrap(soup.new_tag("ul"))
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "patch-update":
+            assert len(header.blocks) == 1
+            self.champions.extend(ChampionChange.split_block(header.blocks[0], mid_patch_update=True))
+        else:
+            super().dispatch_header(header)
+
+class PatchNotesParser_8_20(PatchNotesParser):
+    parser_patch_version = "8.20"
+    parser_others_headers = [
+        "patch-end-of-season-eligibility",
+    ]
+
+class PatchNotesParser_8_21(PatchNotesParser):
+    parser_patch_version = "8.21"
+    parser_others_headers = [
+        "patch-camouflage",
+        "patch-on-my-way-ping-audio",
+        "patch-hud-font-size",
+    ]
+    parser_removed_blocks = [
+        "patch-gragas-audio-clarity-updates",
+    ]
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "patch-mid-patch-updates":
+            yorick_bugfix, turret_fixes = header.blocks
+            self.champions.extend(ChampionChange.split_block(yorick_bugfix, mid_patch_update=True))
+            # add "Turret Fixes" as an "others" change
+            assert turret_fixes.title.endswith("Turret Fixes")
+            change = OtherChange()
+            change.title = "Turret Fixes"
+            change.mid_patch_update = True
+            assert len(turret_fixes.changes) == 1
+            change.changes = turret_fixes.changes[0].changes
+            self.others.append(change)
+        else:
+            super().dispatch_header(header)
+
+
+
+def command_parse(_, args):
+    if args.pdb:
+        try:
+            import ipdb as pdb
+        except ImportError:
+            import pdb
+        import traceback
+        def excepthook(typ, value, tb):
+            traceback.print_exception(typ, value, tb)
+            pdb.pm()
+        excepthook_orig, sys.excepthook = sys.excepthook, excepthook
+
+    parser = PatchNotesParser.from_file(args.file)
+
+    if args.pdb:
+        sys.excepthook = excepthook_orig
+
+    json.dump(parser.serialize(), args.output, sort_keys=True, indent=2)
+    args.output.write("\n")
+
+def command_download(parser, args):
+    m = re.match(r"^(\d+)\.(\d+)$", args.version)
+    if not m:
+        parser.error(f"invalid version format: {args.version}")
+    major, minor = m.groups()
+
+    url = f"https://na.leagueoflegends.com/en/news/game-updates/patch/patch-{major}{minor}-notes"
+    logging.info(f"download patch notes {major}.{minor} from {url}")
+
+    import shutil
+    import urllib.request
+    request = urllib.request.Request(url, headers={"User-Agent": ""})
+    with urllib.request.urlopen(request) as r:
+        shutil.copyfileobj(r, args.output)
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="be verbose")
+    subparsers = parser.add_subparsers(dest="command", help="command")
+
+    subparser = subparsers.add_parser("parse", help="parse HTML patch notes")
+    subparser.add_argument("-o", "--output", type=argparse.FileType("w"), default=sys.stdout,
+                           help="output file (default: stdout)")
+    subparser.add_argument("file", metavar="HTML",
+                           help="patch notes HTML file to parse")
+    subparser.add_argument("--pdb", action="store_true",
+                           help="enable pdb/ipdb post-mortem on parsing error (for debug)")
+
+    subparser = subparsers.add_parser("download", help="download patch notes from leagueoflegends.com")
+    subparser.add_argument("-o", "--output", type=argparse.FileType("wb"), default=sys.stdout,
+                           help="output file (default: stdout)")
+    subparser.add_argument("version", metavar="X.YY",
+                           help="patch version to fetch")
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        loglevel = logging.DEBUG
+    else:
+        loglevel = logging.INFO
+
+    logging.basicConfig(
+        level=loglevel,
+        datefmt="%H:%M:%S",
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
+    globals()[f"command_{args.command.replace('-', '_')}"](parser, args)
+
+if __name__ == "__main__":
+    main()
+
