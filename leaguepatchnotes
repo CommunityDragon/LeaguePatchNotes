@@ -186,6 +186,15 @@ class PatchHeaderBlock(PatchBlockBase):
                 self.parse_reference_link(elem)
                 elem = next(children)
 
+            # handle labels (not in an element, cannot use soup_extract_labels())
+            # also, they have an extract "float-left" attribute
+            self.labels = soup_extract_labels(elem)
+            while elem.name == "span":
+                if elem.string is None or elem.get("class") != [elem.string, "float-left"]:
+                    break  # stop at first non-label element
+                self.labels.append(elem.string)
+                elem = next(children)
+
             if soup_match(elem, "h3"):
                 # note: usually, class="change-title"
                 self.parse_title(elem)
@@ -328,36 +337,45 @@ class PatchAttributeChange:
         assert name == "attribute"
         self.labels = soup_extract_labels(span)
         if len(span) == 0:
-            # no title (may happen when there is a badge)
+            # no title (may happen when there is a label)
             self.title = ""
         else:
             assert len(span) == 1 and span.string is not None
             self.title = span.string
 
         # multiple configurations are possible, gues it from second span
-        name, span = spans[1]
-        if name == "attribute-after":
+        first_name = spans[1][0]
+        if len(spans) == 2 and first_name == "attribute-after":
             # 'after' only
-            assert len(spans) == 2
-            self.after = soup_pretty_text(span)
-
-        elif name == "attribute-removed":
+            self.after = soup_pretty_text(spans[1][1])
+        elif len(spans) == 2 and first_name == "attribute-removed":
             # 'before' only
-            assert len(spans) == 2
-            self.before = soup_pretty_text(span)
+            self.before = soup_pretty_text(spans[1][1])
+        elif len(spans) == 5 and first_name == "attribute-after":
+            # 'prefix before => after'
+            # Prepend 'prerix' to 'before' and 'after'.
+            #TODO Tag only one part of the whole change as before/after;
+            # this would require to guess the part of "after" that matches "before".
+            _, prefix, before, change, after = spans
+            prefix_text = soup_pretty_text(prefix[1]) + " "
 
-        elif name == "attribute-before":
+            assert before[0] == "attribute-before"
+            self.before = prefix_text + soup_pretty_text(before[1])
+            assert change[0] == "change-indicator"
+
+            assert after[0] == "attribute-after"
+            self.after = prefix_text + soup_pretty_text(after[1])
+        elif len(spans) == 4 and first_name == "attribute-before":
             # 'before => after'
-            assert len(spans) == 4
-            self.before = soup_pretty_text(span)
-            assert spans[2][0] == "change-indicator"
+            _, before, change, after = spans
+            self.before = soup_pretty_text(before[1])
+            assert change[0] == "change-indicator"
 
-            name, span = spans[3]
-            assert name == "attribute-after"
-            self.after = soup_pretty_text(span)
+            assert after[0] == "attribute-after"
+            self.after = soup_pretty_text(after[1])
 
         else:
-            assert False, f"unexpected attribute's span name: {name}"
+            assert False, f"unexpected spans configuration: {', '.join(s[0] for s in spans)}"
 
 
 class ElementChangeBase:
@@ -743,7 +761,10 @@ class OtherChange(ElementChangeBase):
         if isinstance(elem, PatchHeader):
             self.parse_header(elem, nested)
         elif isinstance(elem, PatchHeaderBlock):
-            self.parse_header_block(elem)
+            if nested:
+                self.parse_header_block_nested(elem)
+            else:
+                self.parse_header_block(elem)
         elif elem is not None:
             raise TypeError(elem)
 
@@ -810,11 +831,11 @@ class OtherChange(ElementChangeBase):
         for block_change in block.changes:
             assert not block_change.title_link
             assert not block_change.title_image
-            assert not block_change.labels
             change = OtherChange()
             change.title = block_change.title
             change.summary = block_change.summary
             change.context = block_change.context
+            change.labels = block_change.labels
             change.changes = block_change.changes
             self.changes.append(change)
 
@@ -1007,7 +1028,7 @@ class PatchNotesParser(object, metaclass=PatchNotesParserMeta):
         elif header.id in self.parser_others_headers:
             # "others" header (note: we don't check that they actually exist)
             self.others.append(OtherChange(header))
-        elif header.id == "patch-patch-highlights":
+        elif header.id in "patch-patch-highlights":
             self.handle_patch_highlights_header(header)
         elif header.id == "patch-champions":
             self.handle_champions_header(header)
@@ -1158,22 +1179,13 @@ class PatchNotesParser_8_14(PatchNotesParser):
         container = soup.select_one("#patch-notes-container")
 
         # Fizz' "refund on kill" attribute change contains an additional
-        # span without class with a new effect.
+        # span without class with a new effect. Add a "attribute-after" to it.
         for elem in container.select("h3#patch-fizz ~ div.attribute-change"):
             if elem.contents[0].string == "REFUND ON KILL":
+                elem.contents[1]["class"] = ["attribute-after"]
                 break
         else:
             assert False, "'refund onk kill' attribute not found"
-
-        # Duplicate the attribute to add one with the new effect
-        new_elem = soup.new_tag("div", **{"class": "attribute-change"})
-        e = soup.new_tag("span", **{"class": "attribute"})
-        e.string = "REFUND ON KILL"
-        new_elem.append(e)
-        e = soup.new_tag("span", **{"class": "attribute-after"})
-        e.string = elem.contents[1].extract().string
-        new_elem.append(e)
-        elem.insert_before(new_elem)
 
         # Remove the image and title from "Cursor Update"
         elem = container.select_one("h2#patch-cursor-update")
@@ -1367,6 +1379,91 @@ class PatchNotesParser_8_21(PatchNotesParser):
         else:
             super().dispatch_header(header)
 
+class PatchNotesParser_8_23(PatchNotesParser):
+    parser_patch_version = "8.23"
+    parser_others_headers = [
+        "patch-in-game-stats-panel",
+        "patch-ranked-armor",
+        "patch-game-lobbies",
+        "patch-missions",
+    ]
+    #TODO bugfixes has sublists
+
+    @classmethod
+    def normalize_soup(cls, soup):
+        super().normalize_soup(soup)
+        container = soup.select_one("#patch-notes-container")
+
+        # remove additional <div> around highlights video
+        elem = container.select_one("header.header-primary + div.content-border > div.white-stone > div > div > iframe").parent
+        elem.unwrap()
+
+        # fix "Turret Adjustments" not in a <div>
+        elem = container.select_one("> div.content-border > div.white-stone > h3").parent
+        children = list(elem.children)
+        elem.clear()
+        div = soup.new_tag("div")
+        for e in children:
+            div.append(e)
+        elem.append(div)
+
+        # "Dark Harvest" has two summaries, merge them
+        elem = container.select_one("h2#runes").parent
+        # 4th block after the header
+        for _ in range(4):
+            elem = elem.next_sibling
+        p1, p2 = elem.select("p.summary")
+        p1.append(soup.new_tag("br"))
+        p1.append(p2.string)
+        p2.extract()
+
+    def dispatch_header(self, header: PatchHeader):
+        if header.id == "items":
+            (doran_shield, guinsoo, jungle_items, relic_shield, wards) = header.blocks
+
+            # standard items
+            for block in (doran_shield, guinsoo):
+                self.items.append(ItemChange(block))
+
+            # "Jungle Items"
+            self.others.append(OtherChange(jungle_items))
+
+            # "Trinket Scaling" is for all trinkets
+            # tweak images manually
+            assert wards.changes[1].title_image is None
+            wards.changes[1].title_image = [f"//ddragon.leagueoflegends.com/cdn/x/img/item/{item_id}.png" for item_id in (3340, 3342, 2057)]
+            # "Relic shield Upgrades", "Wards & Trinkets"
+            for block in (relic_shield, wards):
+                self.items.extend(ItemChange.split_block(block))
+
+        elif header.id == "runes":
+            # runes with a first "Rune Stats" block
+            for block in header.blocks[1:]:
+                self.runes.append(RuneChange(block))
+            # add an individual "others" change with the first block
+            self.others.append(OtherChange(header.blocks[0]))
+
+        elif header.id == "turrets":
+            assert len(header.blocks) == 2
+            self.others.append(OtherChange(header.blocks[0]))
+            self.others.append(OtherChange(header.blocks[1], nested=True))
+
+        elif header.id == "minions-and-monsters":
+            assert len(header.blocks) == 4
+            self.others.append(OtherChange(header.blocks[0], nested=True))
+            self.others.append(OtherChange(header.blocks[1]))
+            self.others.append(OtherChange(header.blocks[2], nested=True))
+            self.others.append(OtherChange(header.blocks[3]))
+
+        elif header.id == "bounties":
+            assert len(header.blocks) == 2
+            self.others.append(OtherChange(header.blocks[0], nested=True))
+            self.others.append(OtherChange(header.blocks[1]))
+
+        else:
+            # add "patch-" prefix before all header IDs to match previous patches
+            header.id = "patch-" + header.id
+            super().dispatch_header(header)
 
 
 def command_parse(_, args):
